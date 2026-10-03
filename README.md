@@ -1,5 +1,5 @@
-#Hyper Typer#
+# Hyper Typer
 A typing game where you type very hyperly
 
-##Team##
+## Team
 Skanda (building Hyper Typer)
