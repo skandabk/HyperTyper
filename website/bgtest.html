@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Background</title>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Background layer: sits behind everything and ignores all pointer input */
+  #bg {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    z-index: 0;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  #bg video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    pointer-events: none;
+  }
+
+  /* YouTube iframe scaled so a 16:9 frame always covers the viewport */
+  #bg iframe {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100vw, 177.78vh);
+    height: max(100vh, 56.25vw);
+    transform: translate(-50%, -50%);
+    border: 0;
+    pointer-events: none;
+  }
+
+  /* Foreground controls */
+  .panel {
+    position: relative;
+    z-index: 1;
+    width: min(92vw, 480px);
+    padding: 20px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.9);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+
+  h1 {
+    margin: 0 0 12px;
+    font-size: 1.1rem;
+    color: #222;
+  }
+
+  .urlrow {
+    display: flex;
+    gap: 8px;
+  }
+
+  input[type="url"] {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+    font-size: 1rem;
+    border: 1px solid #bbb;
+    border-radius: 8px;
+  }
+
+  button, label.filebtn {
+    padding: 10px 16px;
+    font-size: 1rem;
+    border: 0;
+    border-radius: 8px;
+    background: #2563eb;
+    color: #fff;
+    cursor: pointer;
+  }
+
+  button:hover, label.filebtn:hover { background: #1d4ed8; }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+
+  label.filebtn {
+    display: inline-block;
+    background: #475569;
+    font-size: 0.9rem;
+    padding: 8px 12px;
+  }
+
+  label.filebtn:hover { background: #334155; }
+
+  #file { display: none; }
+
+  label.sound {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.9rem;
+    color: #444;
+  }
+
+  #status {
+    min-height: 1.2em;
+    margin: 12px 0 0;
+    font-size: 0.9rem;
+    color: #555;
+  }
+
+  #status.error { color: #b91c1c; }
+
+  #hint {
+    margin: 8px 0 0;
+    font-size: 0.8rem;
+    color: #7a5b00;
+    background: #fff7d6;
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+
+  #hint:empty { display: none; }
+</style>
+</head>
+<body>
+
+<div id="bg" aria-hidden="true"></div>
+
+<main class="panel">
+  <h1>Play a video as the background</h1>
+
+  <!-- Deliberately not a <form>: sandboxed previews without "allow-forms" never fire submit -->
+  <div class="urlrow">
+    <input id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+           placeholder="Paste a video link (.mp4, .webm, or YouTube)">
+    <button id="play" type="button">Play</button>
+  </div>
+
+  <div class="row">
+    <label class="filebtn" for="file">Or choose a video file…</label>
+    <input id="file" type="file" accept="video/*">
+    <label class="sound">
+      <input id="sound" type="checkbox"> Play with sound
+    </label>
+  </div>
+
+  <p id="status" role="status"></p>
+  <p id="hint"></p>
+</main>
+
+<script>
+  const DIRECT_TIMEOUT_MS = 12000;   // give up if a video never starts
+  const YOUTUBE_TIMEOUT_MS = 15000;  // give up if the YouTube player never becomes ready
+
+  const playBtn = document.getElementById('play');
+  const urlInput = document.getElementById('url');
+  const fileInput = document.getElementById('file');
+  const soundBox = document.getElementById('sound');
+  const bg = document.getElementById('bg');
+  const statusEl = document.getElementById('status');
+  const hintEl = document.getElementById('hint');
+
+  let ytPlayer = null;
+  let ytApiPromise = null;
+  let runId = 0;              // bumps on every new play request so stale callbacks are ignored
+  let watchdog = null;
+  let currentObjectUrl = null;
+
+  function setStatus(msg, isError = false) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('error', isError);
+  }
+
+  function stopWatchdog() {
+    clearTimeout(watchdog);
+    watchdog = null;
+  }
+
+  function startWatchdog(id, ms, message) {
+    stopWatchdog();
+    watchdog = setTimeout(() => {
+      if (id !== runId) return;
+      finish(message, true);
+    }, ms);
+  }
+
+  // Remove whatever is playing and return the page to a blank background
+  function clearBackground() {
+    stopWatchdog();
+    if (ytPlayer && typeof ytPlayer.destroy === 'function') {
+      try { ytPlayer.destroy(); } catch (e) { /* ignore */ }
+    }
+    ytPlayer = null;
+    bg.innerHTML = '';
+    if (currentObjectUrl) {
+      URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = null;
+    }
+  }
+
+  function finish(message, isError = false) {
+    clearBackground();
+    setStatus(message, isError);
+  }
+
+  // Tell the person up front when the page is running somewhere that restricts media
+  (function showEnvironmentHint() {
+    const notes = [];
+    if (location.protocol === 'file:') {
+      notes.push('This page was opened as a local file, so YouTube links may be refused. Direct video links and "choose a file" still work.');
+    }
+    let framed = false;
+    try { framed = window.self !== window.top; } catch (e) { framed = true; }
+    if (framed) {
+      notes.push('This page is running inside a preview. Previews often block videos from other websites. If a link will not play, use "Or choose a video file", or open this page in your own browser.');
+    }
+    hintEl.textContent = notes.join(' ');
+  })();
+
+  // Links that point at a web page containing a video, not at the video file itself
+  function pageLinkProblem(link) {
+    let host = '';
+    try { host = new URL(link).hostname.replace(/^www\./, ''); } catch (e) { return null; }
+    const pageOnly = [
+      'vimeo.com', 'drive.google.com', 'dropbox.com', 'instagram.com', 'tiktok.com',
+      'twitter.com', 'x.com', 'facebook.com', 'fb.watch', 'twitch.tv', 'dailymotion.com'
+    ];
+    if (pageOnly.some((h) => host === h || host.endsWith('.' + h))) {
+      return 'That link opens a web page, not a video file, so it cannot be used as a background. Use a direct .mp4 or .webm link, a YouTube link, or choose a file from your device.';
+    }
+    return null;
+  }
+
+  function getYouTubeId(link) {
+    try {
+      const u = new URL(link);
+      const host = u.hostname.replace(/^www\.|^m\./, '');
+      if (host === 'youtu.be') return u.pathname.slice(1).split('/')[0] || null;
+      if (host === 'youtube.com' || host === 'youtube-nocookie.com') {
+        if (u.searchParams.get('v')) return u.searchParams.get('v');
+        const m = u.pathname.match(/^\/(?:embed|shorts|live|v)\/([^/?]+)/);
+        if (m) return m[1];
+      }
+    } catch (e) { /* not a valid URL */ }
+    return null;
+  }
+
+  function describeMediaError(code, isLocalFile) {
+    switch (code) {
+      case 1:
+        return 'Playback was cancelled.';
+      case 2:
+        return 'Network error while loading the video. The link may be wrong, or the server may be refusing the request.';
+      case 3:
+        return 'The video was found but could not be decoded. Try an MP4 (H.264) or WebM file.';
+      default:
+        return isLocalFile
+          ? 'This browser cannot play that file format. Try an MP4 (H.264) or WebM file.'
+          : 'The video could not be loaded. The link may not point directly to a video file, the format may be unsupported, or this viewer may be blocking outside media. Try a different link, open this page in your own browser, or choose a file from your device.';
+    }
+  }
+
+  function loadYouTubeApi() {
+    if (window.YT && window.YT.Player) return Promise.resolve();
+    if (!ytApiPromise) {
+      ytApiPromise = new Promise((resolve, reject) => {
+        const previous = window.onYouTubeIframeAPIReady;
+        window.onYouTubeIframeAPIReady = () => {
+          if (typeof previous === 'function') previous();
+          resolve();
+        };
+        const s = document.createElement('script');
+        s.src = 'https://www.youtube.com/iframe_api';
+        s.onerror = () => {
+          ytApiPromise = null;
+          reject(new Error('Could not load the YouTube player. You may be offline, or this viewer may be blocking outside sites.'));
+        };
+        document.head.appendChild(s);
+      });
+    }
+    return ytApiPromise;
+  }
+
+  function playDirect(src, withSound, id, isLocalFile) {
+    const v = document.createElement('video');
+    v.preload = 'auto';
+    v.src = src;
+    v.autoplay = true;
+    v.muted = !withSound;
+    v.playsInline = true;
+    v.controls = false;
+    v.disablePictureInPicture = true;
+    v.setAttribute('controlsList', 'nodownload noremoteplayback');
+
+    v.addEventListener('playing', () => {
+      if (id !== runId) return;
+      stopWatchdog();
+      setStatus('Playing…');
+    });
+    v.addEventListener('ended', () => {
+      if (id !== runId) return;
+      finish('Video ended.');
+    });
+    v.addEventListener('error', () => {
+      if (id !== runId) return;
+      finish(describeMediaError(v.error && v.error.code, isLocalFile), true);
+    });
+
+    bg.appendChild(v);
+
+    startWatchdog(id, DIRECT_TIMEOUT_MS,
+      'The video did not start within ' + (DIRECT_TIMEOUT_MS / 1000) + ' seconds. ' +
+      (isLocalFile
+        ? 'The file may be in a format this browser cannot play.'
+        : 'The link may be wrong, too slow, or blocked by this viewer. Try choosing a file from your device instead.'));
+
+    v.play().catch(() => {
+      // Browser blocked unmuted autoplay: fall back to muted
+      if (!v.muted) {
+        v.muted = true;
+        v.play().catch(() => {});
+      }
+    });
+  }
+
+  function describeYouTubeError(code) {
+    switch (code) {
+      case 2:
+        return 'That does not look like a valid YouTube video link.';
+      case 100:
+        return 'YouTube could not find that video. It may be private or deleted.';
+      case 101:
+      case 150:
+        return 'The owner of that YouTube video does not allow it to be embedded.';
+      case 153:
+        return 'YouTube refused to embed from this page. Pages opened straight from disk are refused; serve the page over http(s) or open it in a viewer that allows embeds.';
+      default:
+        return 'YouTube could not play that video here.';
+    }
+  }
+
+  async function playYouTube(ytId, withSound, id) {
+    try {
+      await loadYouTubeApi();
+    } catch (err) {
+      if (id === runId) setStatus(err.message, true);
+      return;
+    }
+    if (id !== runId) return; // a newer request replaced this one
+
+    const holder = document.createElement('div');
+    holder.id = 'yt-holder';
+    bg.appendChild(holder);
+
+    startWatchdog(id, YOUTUBE_TIMEOUT_MS,
+      'YouTube did not respond. This viewer is probably blocking embedded sites. Open the page in your own browser, or use a direct video link or a file from your device.');
+
+    ytPlayer = new YT.Player('yt-holder', {
+      videoId: ytId,
+      playerVars: {
+        autoplay: 1,
+        controls: 0,
+        disablekb: 1,
+        fs: 0,
+        modestbranding: 1,
+        rel: 0,
+        iv_load_policy: 3,
+        playsinline: 1
+      },
+      events: {
+        onReady: (e) => {
+          if (id !== runId) return;
+          stopWatchdog();
+          if (!withSound) e.target.mute();
+          e.target.playVideo();
+          setStatus('Playing…');
+        },
+        onStateChange: (e) => {
+          if (id !== runId) return;
+          if (e.data === YT.PlayerState.ENDED) finish('Video ended.');
+        },
+        onError: (e) => {
+          if (id !== runId) return;
+          finish(describeYouTubeError(e.data), true);
+        }
+      }
+    });
+  }
+
+  function startFromInput() {
+    const link = urlInput.value.trim();
+    if (!link) {
+      setStatus('Paste a video link first.', true);
+      return;
+    }
+    if (!/^https?:\/\//i.test(link)) {
+      setStatus('That does not look like a link. It should start with http:// or https://', true);
+      return;
+    }
+
+    const id = ++runId;
+    clearBackground();
+
+    const problem = pageLinkProblem(link);
+    if (problem) {
+      setStatus(problem, true);
+      return;
+    }
+
+    setStatus('Loading…');
+
+    const ytId = getYouTubeId(link);
+    if (ytId) {
+      playYouTube(ytId, soundBox.checked, id);
+    } else {
+      playDirect(link, soundBox.checked, id, false);
+    }
+  }
+
+  playBtn.addEventListener('click', startFromInput);
+  urlInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      startFromInput();
+    }
+  });
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+
+    const id = ++runId;
+    clearBackground();
+    setStatus('Loading…');
+
+    currentObjectUrl = URL.createObjectURL(file);
+    playDirect(currentObjectUrl, soundBox.checked, id, true);
+
+    fileInput.value = ''; // lets the same file be chosen again later
+  });
+</script>
+</body>
+</html>
