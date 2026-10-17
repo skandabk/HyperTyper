@@ -204,7 +204,7 @@
   }
 
   function clearBackground() {
-    """Clears the background to be replaced or to be empty for future use"""
+    //Clears the background to be replaced or to be empty for future use
     stopWatchdog();
     if (ytPlayer && typeof ytPlayer.destroy === 'function') {
       try { ytPlayer.destroy(); } catch (e) { /* ignore */ }
@@ -218,7 +218,7 @@
   }
 
   function finish(message, isError = false) {
-    """Clears the background after the video finishes"""
+    //Clears the background after the video finishes
     clearBackground();
     setStatus(message, isError);
   }
